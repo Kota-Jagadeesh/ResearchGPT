@@ -8,4 +8,4 @@ embeddings/
 data/
 .venvrc
 venv/
-.run.txt
+run.txt
