@@ -1,0 +1,10 @@
+.env
+.venv/
+.vector_db/
+results/
+__pycache__/
+embeddings/
+*.pyc
+data/
+.venvrc
+venv/
