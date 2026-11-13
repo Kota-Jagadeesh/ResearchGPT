@@ -35,8 +35,8 @@ os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 #      "BAAI/bge-base-en-v1.5" (512 tokens)
 # ==========================================================
 
-CHUNK_SIZE_TOKENS = 500
-CHUNK_OVERLAP_TOKENS = 50
+CHUNK_SIZE_TOKENS = 250
+CHUNK_OVERLAP_TOKENS = 40
 
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 EMBEDDING_MODEL_MAX_TOKENS = 256
