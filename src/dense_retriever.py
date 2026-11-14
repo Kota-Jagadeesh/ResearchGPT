@@ -38,11 +38,73 @@ _model = None
 _index = None
 _metadata = None
 _embeddings = None
+_last_loaded_mtime = 0.0
+
+
+def reload_resources():
+    """Forces reloading of FAISS index, metadata, and embeddings from disk."""
+    global _index, _metadata, _embeddings, _last_loaded_mtime
+    _index = None
+    _metadata = None
+    _embeddings = None
+    _last_loaded_mtime = 0.0
+    _load_resources()
+
+
+def get_indexed_paper_names():
+    """Returns set of paper names currently present in the metadata index."""
+    _load_resources()
+    if not _metadata:
+        return set()
+    return {item.get("paper_name") for item in _metadata if item.get("paper_name")}
+
+
+def get_paper_title(paper_name):
+    """Extracts a readable academic title for a paper from its first metadata chunks."""
+    _load_resources()
+    clean_fallback = paper_name.replace(".pdf", "").replace("_", " ").strip()
+    if not _metadata:
+        return clean_fallback
+
+    for m in _metadata:
+        if m.get("paper_name") == paper_name and m.get("chunk_id") in (1, 2):
+            text = m.get("chunk_text", "")
+            lines = [l.strip() for l in text.split("\n") if l.strip()]
+            for l in lines:
+                l_upper = l.upper()
+                if (
+                    len(l) > 15
+                    and not l.startswith("http")
+                    and not l_upper.startswith("ISSN")
+                    and not l_upper.startswith("DOI")
+                    and not l_upper.startswith("COMMENT")
+                    and not l_upper.startswith("RECEIVED")
+                    and not l_upper.startswith("ACCEPTED")
+                    and not l_upper.startswith("PUBLISHED")
+                    and not l_upper.startswith("IJARSCT")
+                    and not l_upper.startswith("INTERNATIONAL JOURNAL")
+                    and not l_upper.startswith("JOURNAL OF")
+                    and not l_upper.startswith("PROCEEDINGS OF")
+                    and not l_upper.startswith("VOLUME")
+                    and not l_upper.startswith("ISSUE")
+                    and not l_upper.startswith("COPYRIGHT")
+                    and not l_upper.startswith("WWW.")
+                    and not l_upper.startswith("IMPACT FACTOR")
+                    and not l_upper.startswith("SUBMISSION ID")
+                    and not l_upper.startswith("DOCUMENT DETAILS")
+                    and not l_upper.startswith("PAGE")
+                    and not l_upper.startswith("AMRITA")
+                    and not l_upper.startswith("QUICK SUBMIT")
+                    and not l_upper.startswith("SUBMISSION DATE")
+                ):
+                    return l[:100]
+
+    return clean_fallback
 
 
 def _load_resources():
 
-    global _model, _index, _metadata, _embeddings
+    global _model, _index, _metadata, _embeddings, _last_loaded_mtime
 
     if _model is None:
 
@@ -53,6 +115,19 @@ def _load_resources():
         _model = SentenceTransformer("all-MiniLM-L6-v2")
 
         print("Sentence-BERT Loaded Successfully.\n")
+
+    # Check if disk files were updated since last load
+    disk_mtime = 0.0
+    if os.path.exists(INDEX_PATH):
+        disk_mtime = max(disk_mtime, os.path.getmtime(INDEX_PATH))
+    if os.path.exists(METADATA_PATH):
+        disk_mtime = max(disk_mtime, os.path.getmtime(METADATA_PATH))
+
+    if disk_mtime > _last_loaded_mtime:
+        # Disk files updated, invalidate existing cached index
+        _index = None
+        _metadata = None
+        _embeddings = None
 
     if _index is None:
 
@@ -88,19 +163,38 @@ def _load_resources():
             dtype=np.float32
         )
 
+    _last_loaded_mtime = disk_mtime
+
+
+# ==========================================================
+# Query Encoding Function
+# ==========================================================
+
+def encode_query(question):
+    if not question.strip():
+        return None
+    _load_resources()
+    embedding = _model.encode(
+        [question],
+        convert_to_numpy=True,
+        normalize_embeddings=True
+    ).astype(np.float32)
+    return embedding[0]
+
 
 # ==========================================================
 # Retrieve Function
 # ==========================================================
 
-def retrieve(question, top_k=100):
+def retrieve(question, top_k=100, paper_filter=None):
 
     if not question.strip():
         return []
 
     _load_resources()
 
-    top_k = min(top_k, _index.ntotal)
+    if _index is None or len(_metadata) == 0:
+        return []
 
     question_embedding = _model.encode(
         [question],
@@ -108,9 +202,15 @@ def retrieve(question, top_k=100):
         normalize_embeddings=True
     ).astype(np.float32)
 
+    paper_filter_set = set(paper_filter) if paper_filter else None
+
+    # When paper_filter is set, search all chunks in the index to guarantee
+    # we find the best chunks belonging to the targeted paper(s).
+    search_k = _index.ntotal if paper_filter_set else min(top_k, _index.ntotal)
+
     distances, indices = _index.search(
         question_embedding,
-        top_k
+        search_k
     )
 
     results = []
@@ -120,13 +220,21 @@ def retrieve(question, top_k=100):
         if idx < 0 or idx >= len(_metadata):
             continue
 
-        record = _metadata[idx].copy()
+        record = _metadata[idx]
 
-        record["distance"] = float(distance)
+        if paper_filter_set and record.get("paper_name") not in paper_filter_set:
+            continue
 
-        record["embedding"] = _embeddings[idx]
+        item = record.copy()
+        item["distance"] = float(distance)
 
-        results.append(record)
+        if _embeddings is not None and idx < len(_embeddings):
+            item["embedding"] = _embeddings[idx]
+
+        results.append(item)
+
+        if len(results) >= top_k:
+            break
 
     return results
 

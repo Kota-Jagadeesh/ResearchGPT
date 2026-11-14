@@ -3,6 +3,8 @@ from preprocessing import preprocess_all_files
 from chunking import chunk_all_files
 from embedding import generate_embeddings
 from faiss_db import build_faiss_index
+from dense_retriever import reload_resources as reload_dense
+from bm25_retriever import reload_resources as reload_bm25
 
 
 def run_pipeline():
@@ -31,6 +33,17 @@ def run_pipeline():
     # ----------------------------------------------------
     print("\nStep 5 : Building FAISS Index\n")
     build_faiss_index()
+
+    # ----------------------------------------------------
+    print("\nStep 6 : Refreshing In-Memory Search Caches\n")
+    try:
+        reload_dense()
+    except Exception as e:
+        print(f"Notice: Dense cache refresh: {e}")
+    try:
+        reload_bm25()
+    except Exception as e:
+        print(f"Notice: BM25 cache refresh: {e}")
 
     print("\n")
     print("=" * 70)

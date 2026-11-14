@@ -18,6 +18,14 @@ METADATA_FILE = os.path.join(
 
 )
 
+EMBEDDINGS_FILE = os.path.join(
+
+    VECTOR_FOLDER,
+
+    "embeddings.pkl"
+
+)
+
 # ==========================================================
 # Tokenizer
 # ==========================================================
@@ -47,11 +55,34 @@ def tokenize(text):
 
 _metadata = None
 _bm25 = None
+_embeddings = None
+_last_loaded_mtime = 0.0
+
+
+def reload_resources():
+    """Forces reloading of BM25 corpus, metadata, and embeddings from disk."""
+    global _metadata, _bm25, _embeddings, _last_loaded_mtime
+    _metadata = None
+    _bm25 = None
+    _embeddings = None
+    _last_loaded_mtime = 0.0
+    _load_resources()
 
 
 def _load_resources():
 
-    global _metadata, _bm25
+    global _metadata, _bm25, _embeddings, _last_loaded_mtime
+
+    disk_mtime = 0.0
+    if os.path.exists(METADATA_FILE):
+        disk_mtime = max(disk_mtime, os.path.getmtime(METADATA_FILE))
+    if os.path.exists(EMBEDDINGS_FILE):
+        disk_mtime = max(disk_mtime, os.path.getmtime(EMBEDDINGS_FILE))
+
+    if disk_mtime > _last_loaded_mtime:
+        _metadata = None
+        _bm25 = None
+        _embeddings = None
 
     if _metadata is None:
 
@@ -67,6 +98,15 @@ def _load_resources():
 
             _metadata = pickle.load(file)
 
+    if _embeddings is None and os.path.exists(EMBEDDINGS_FILE):
+
+        with open(
+            EMBEDDINGS_FILE,
+            "rb"
+        ) as file:
+
+            _embeddings = pickle.load(file)
+
     if _bm25 is None:
 
         corpus = []
@@ -81,6 +121,8 @@ def _load_resources():
 
         _bm25 = BM25Okapi(corpus)
 
+    _last_loaded_mtime = disk_mtime
+
 
 # ==========================================================
 # Sparse Retrieval
@@ -90,7 +132,9 @@ def bm25_search(
 
     question,
 
-    top_k=20
+    top_k=20,
+
+    paper_filter=None
 
 ):
 
@@ -98,6 +142,9 @@ def bm25_search(
         return []
 
     _load_resources()
+
+    if _bm25 is None or len(_metadata) == 0:
+        return []
 
     tokens = tokenize(
 
@@ -113,7 +160,7 @@ def bm25_search(
 
     ranked = sorted(
 
-        zip(scores, _metadata),
+        zip(scores, range(len(_metadata)), _metadata),
 
         reverse=True,
 
@@ -121,21 +168,30 @@ def bm25_search(
 
     )
 
+    paper_filter_set = set(paper_filter) if paper_filter else None
+
     results = []
 
-    for score, item in ranked[:top_k]:
+    for score, idx, item in ranked:
+
+        if paper_filter_set and item.get("paper_name") not in paper_filter_set:
+            continue
 
         result = item.copy()
 
         result["bm25_score"] = float(score)
 
-        results.append(
+        if _embeddings is not None and idx < len(_embeddings):
 
-            result
+            result["embedding"] = _embeddings[idx]
 
-        )
+        results.append(result)
+
+        if len(results) >= top_k:
+            break
 
     return results
+
 
 # ==========================================================
 # Testing

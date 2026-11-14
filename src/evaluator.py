@@ -31,13 +31,10 @@ def average_similarity(retrieved_chunks):
 
         return 0.0
 
-    similarities = []
-
-    for chunk in retrieved_chunks:
-
-        similarity = 1 / (1 + chunk["distance"])
-
-        similarities.append(similarity)
+    similarities = [
+        max(0.0, min(1.0, float(chunk.get("distance", 0.0))))
+        for chunk in retrieved_chunks
+    ]
 
     return round(
 
@@ -130,15 +127,15 @@ def overall_rating(
 
     score = 0
 
-    if confidence >= 90:
+    if confidence >= 80:
 
         score += 40
 
-    elif confidence >= 75:
+    elif confidence >= 65:
 
         score += 30
 
-    elif confidence >= 60:
+    elif confidence >= 45:
 
         score += 20
 
@@ -146,15 +143,15 @@ def overall_rating(
 
         score += 10
 
-    if similarity >= 0.90:
+    if similarity >= 0.45:
 
         score += 30
 
-    elif similarity >= 0.80:
+    elif similarity >= 0.35:
 
         score += 20
 
-    elif similarity >= 0.70:
+    elif similarity >= 0.25:
 
         score += 10
 

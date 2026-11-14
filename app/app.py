@@ -42,6 +42,9 @@ from exporter import export_all
 from report import generate_report
 from evaluator import evaluate_system
 from citation import format_sources
+from visualizer import generate_paper_figures_suite
+from dense_retriever import encode_query, reload_resources as reload_dense
+from bm25_retriever import reload_resources as reload_bm25
 
 
 # ==========================================================
@@ -100,6 +103,16 @@ if "recommendations" not in st.session_state:
 if "evaluation" not in st.session_state:
 
     st.session_state.evaluation = None
+
+
+if "figures" not in st.session_state:
+
+    st.session_state.figures = None
+
+
+if "figure_files" not in st.session_state:
+
+    st.session_state.figure_files = None
 
 
 # ==========================================================
@@ -303,6 +316,23 @@ if uploaded_files:
         )
 
 
+raw_pdf_names = {f for f in os.listdir(RAW_FOLDER) if f.endswith(".pdf")}
+chunk_pdf_names = {
+    f.replace("_chunks.txt", "")
+    for f in os.listdir(EMBEDDING_FOLDER)
+    if f.endswith("_chunks.txt")
+}
+unprocessed_papers = sorted(list(raw_pdf_names - chunk_pdf_names))
+
+if unprocessed_papers:
+
+    st.warning(
+        f"⚠️ **{len(unprocessed_papers)} uploaded paper(s) are not indexed yet:** "
+        f"{', '.join(unprocessed_papers)}. "
+        f"Please click **'⚙ Process Papers'** below to index them before asking questions!"
+    )
+
+
 # ==========================================================
 # Buttons
 # ==========================================================
@@ -357,6 +387,8 @@ if process:
             )
 
             run_pipeline()
+            reload_dense()
+            reload_bm25()
 
             progress.progress(
                 100
@@ -478,10 +510,10 @@ if ask:
             "Please enter a question."
         )
 
-    elif chunk_count == 0:
+    elif paper_count == 0:
 
         st.warning(
-            "Please process papers first."
+            "Please upload at least one research paper first."
         )
 
     else:
@@ -489,15 +521,36 @@ if ask:
         try:
 
             # ------------------------------------------------
+            # Auto-Sync Index for Newly Uploaded Papers
+            # ------------------------------------------------
+            raw_pdf_names = {f for f in os.listdir(RAW_FOLDER) if f.endswith(".pdf")}
+            chunk_pdf_names = {
+                f.replace("_chunks.txt", "")
+                for f in os.listdir(EMBEDDING_FOLDER)
+                if f.endswith("_chunks.txt")
+            }
+            unprocessed = sorted(list(raw_pdf_names - chunk_pdf_names))
+
+            if unprocessed or chunk_count == 0:
+                with st.spinner(
+                    f"Indexing {len(unprocessed)} newly uploaded paper(s) before answering..."
+                ):
+                    run_pipeline()
+                    reload_dense()
+                    reload_bm25()
+
+            # ------------------------------------------------
             # Query Rewriting
             # ------------------------------------------------
 
             recent_history = get_history()[-3:]
 
+            target_papers = selected_papers if selected_papers else available_papers[:2]
 
             resolved_question, was_rewritten = rewrite_query(
                 question,
-                recent_history=recent_history
+                recent_history=recent_history,
+                target_papers=target_papers
             )
 
 
@@ -615,27 +668,48 @@ if ask:
             #
             # ==================================================
 
-            LOW_CONFIDENCE_THRESHOLD = 40
+            LOW_CONFIDENCE_THRESHOLD = 30
 
 
             web_fallback_result = None
 
 
-            if confidence["confidence"] < LOW_CONFIDENCE_THRESHOLD:
-
-                st.warning(
-                    "Confidence in your uploaded papers is low for this question. "
-                    "Supplementing with web search results..."
-                )
-
+            # Only trigger web fallback if confidence is truly very low AND no paper chunks were retrieved
+            if confidence["confidence"] < LOW_CONFIDENCE_THRESHOLD and len(retrieved_chunks) == 0:
 
                 with st.spinner(
-                    "Confidence is low – checking the web for additional context..."
+                    "Checking the web for supplementary context..."
                 ):
 
                     web_fallback_result = web_search_fallback(
                         question
                     )
+
+
+            # ------------------------------------------------
+            # Generate Figures for Research Paper
+            # ------------------------------------------------
+
+            paper_figures = {}
+            paper_fig_files = {}
+
+            with st.spinner(
+                "Generating Publication-Ready Figures..."
+            ):
+                try:
+                    q_vec = encode_query(resolved_question)
+                    candidates_pool = confidence.get("candidates_pool") or retrieved_chunks
+                    paper_figures, paper_fig_files = generate_paper_figures_suite(
+                        query=resolved_question,
+                        retrieved_chunks=retrieved_chunks,
+                        confidence=confidence,
+                        groundedness=groundedness,
+                        evaluation=evaluation,
+                        candidate_pool=candidates_pool,
+                        query_vector=q_vec
+                    )
+                except Exception as fig_err:
+                    print(f"Error generating figures: {fig_err}")
 
 
             # ------------------------------------------------
@@ -651,6 +725,10 @@ if ask:
             st.session_state.recommendations = recommendations
 
             st.session_state.evaluation = evaluation
+
+            st.session_state.figures = paper_figures
+
+            st.session_state.figure_files = paper_fig_files
 
 
             # ------------------------------------------------
@@ -718,49 +796,43 @@ if ask:
 
                 st.markdown("---")
 
-                st.subheader(
-                    "🌐 Web Search Fallback"
-                )
+                with st.expander(
+                    "🌐 Supplementary Web Search Results",
+                    expanded=False
+                ):
 
-
-                st.warning(
-                    "Confidence in your uploaded papers was low for this question. "
-                    "Here are supplementary results from the web — these are NOT "
-                    "verified against your papers and should be treated as a starting "
-                    "point for further research, not a substitute answer."
-                )
-
-
-                if web_fallback_result["error"]:
-
-                    st.info(
-                        "Web search unavailable: "
-                        + web_fallback_result["error"]
+                    st.caption(
+                        "Supplementary results from the web (not verified against your papers):"
                     )
 
+                    if web_fallback_result.get("error"):
 
-                elif len(
-                    web_fallback_result["results"]
-                ) == 0:
+                        st.info(
+                            "Web search unavailable: "
+                            + str(web_fallback_result["error"])
+                        )
 
-                    st.info(
-                        "No web results found either."
-                    )
+                    elif len(
+                        web_fallback_result.get("results", [])
+                    ) == 0:
 
+                        st.info(
+                            "No web results found."
+                        )
 
-                else:
+                    else:
 
-                    for item in web_fallback_result["results"]:
+                        for item in web_fallback_result["results"]:
 
-                        with st.container():
+                            with st.container():
 
-                            st.write(
-                                f"**[{item['title']}]({item['url']})**"
-                            )
+                                st.write(
+                                    f"**[{item['title']}]({item['url']})**"
+                                )
 
-                            st.caption(
-                                item["snippet"]
-                            )
+                                st.caption(
+                                    item["snippet"]
+                                )
 
 
             # ==================================================
@@ -898,6 +970,214 @@ if ask:
                 st.metric(
                     "Overall Rating",
                     evaluation["overall_rating"]
+                )
+
+
+            # ==================================================
+            # Research Paper Visualizations & Metrics
+            # ==================================================
+
+            st.markdown("---")
+
+            st.subheader(
+                "📊 Research Paper Visualizations & Comparative Metrics"
+            )
+
+            st.caption(
+                "Publication-ready figures (300 DPI PNG & vector PDF) with LaTeX-ready formatting and descriptive captions for direct inclusion in academic publications."
+            )
+
+            if st.session_state.figures:
+
+                tab1, tab2, tab3, tab4 = st.tabs([
+                    "📈 Fig 1: Retrieval Relevance",
+                    "🔬 Fig 2: AGMR Latent Space",
+                    "🎯 Fig 3: Verification Profile",
+                    "⏱ Fig 4: Latency Breakdown"
+                ])
+
+                # --- Tab 1: Retrieval Relevance ---
+                with tab1:
+                    if "retrieval_relevance" in st.session_state.figures and st.session_state.figures["retrieval_relevance"]:
+                        st.pyplot(st.session_state.figures["retrieval_relevance"], use_container_width=True)
+                        st.markdown(
+                            "**Figure 1:** *Multi-stage retrieval and reranking scores for top candidate chunks.* "
+                            "Shows calibrated Cross-Encoder relevance logits, Sentence-BERT dense semantic similarity, "
+                            "normalized BM25 keyword matching, and the final AGMR blended score across the retrieved hierarchy."
+                        )
+                        f1_files = st.session_state.figure_files.get("retrieval_relevance", {}) if st.session_state.figure_files else {}
+                        d1_col1, d1_col2 = st.columns(2)
+                        with d1_col1:
+                            if "png" in f1_files and os.path.exists(f1_files["png"]):
+                                with open(f1_files["png"], "rb") as f:
+                                    st.download_button(
+                                        "⬇ Download Fig 1 (300 DPI PNG)",
+                                        data=f.read(),
+                                        file_name=os.path.basename(f1_files["png"]),
+                                        mime="image/png",
+                                        key="dl_fig1_png",
+                                        use_container_width=True
+                                    )
+                        with d1_col2:
+                            if "pdf" in f1_files and os.path.exists(f1_files["pdf"]):
+                                with open(f1_files["pdf"], "rb") as f:
+                                    st.download_button(
+                                        "⬇ Download Fig 1 (Vector PDF - LaTeX)",
+                                        data=f.read(),
+                                        file_name=os.path.basename(f1_files["pdf"]),
+                                        mime="application/pdf",
+                                        key="dl_fig1_pdf",
+                                        use_container_width=True
+                                    )
+                        with st.expander("📋 LaTeX Snippet for Figure 1"):
+                            pdf_name = os.path.basename(f1_files.get("pdf", "fig1_retrieval_relevance.pdf"))
+                            st.code(
+                                "\\begin{figure}[htbp]\n"
+                                "  \\centering\n"
+                                f"  \\includegraphics[width=0.9\\linewidth]{{{pdf_name}}}\n"
+                                "  \\caption{Multi-stage retrieval and reranking scores for candidate chunks, comparing Cross-Encoder, Dense Semantic, BM25, and AGMR Blended scores.}\n"
+                                "  \\label{fig:retrieval_relevance}\n"
+                                "\\end{figure}",
+                                language="latex"
+                            )
+
+                # --- Tab 2: AGMR Latent Space (PCA) ---
+                with tab2:
+                    if "agmr_latent_space" in st.session_state.figures and st.session_state.figures["agmr_latent_space"]:
+                        st.pyplot(st.session_state.figures["agmr_latent_space"], use_container_width=True)
+                        st.markdown(
+                            "**Figure 2:** *Two-dimensional PCA projection of candidate passage embeddings under AGMR.* "
+                            "Visualizes Gaussian Mixture Model (GMM) semantic clustering, query vector embedding position (red star), "
+                            "and final diverse passages selected by AGMR (#1 through #k) spanning the candidate manifold."
+                        )
+                        f2_files = st.session_state.figure_files.get("agmr_latent_space", {}) if st.session_state.figure_files else {}
+                        d2_col1, d2_col2 = st.columns(2)
+                        with d2_col1:
+                            if "png" in f2_files and os.path.exists(f2_files["png"]):
+                                with open(f2_files["png"], "rb") as f:
+                                    st.download_button(
+                                        "⬇ Download Fig 2 (300 DPI PNG)",
+                                        data=f.read(),
+                                        file_name=os.path.basename(f2_files["png"]),
+                                        mime="image/png",
+                                        key="dl_fig2_png",
+                                        use_container_width=True
+                                    )
+                        with d2_col2:
+                            if "pdf" in f2_files and os.path.exists(f2_files["pdf"]):
+                                with open(f2_files["pdf"], "rb") as f:
+                                    st.download_button(
+                                        "⬇ Download Fig 2 (Vector PDF - LaTeX)",
+                                        data=f.read(),
+                                        file_name=os.path.basename(f2_files["pdf"]),
+                                        mime="application/pdf",
+                                        key="dl_fig2_pdf",
+                                        use_container_width=True
+                                    )
+                        with st.expander("📋 LaTeX Snippet for Figure 2"):
+                            pdf_name = os.path.basename(f2_files.get("pdf", "fig2_agmr_latent_space.pdf"))
+                            st.code(
+                                "\\begin{figure}[htbp]\n"
+                                "  \\centering\n"
+                                f"  \\includegraphics[width=0.85\\linewidth]{{{pdf_name}}}\n"
+                                "  \\caption{2D PCA projection of candidate passage embeddings under AGMR clustering, illustrating semantic diversity and query alignment.}\n"
+                                "  \\label{fig:agmr_latent_space}\n"
+                                "\\end{figure}",
+                                language="latex"
+                            )
+
+                # --- Tab 3: RAG Verification Profile ---
+                with tab3:
+                    if "performance_radar" in st.session_state.figures and st.session_state.figures["performance_radar"]:
+                        st.pyplot(st.session_state.figures["performance_radar"], use_container_width=True)
+                        st.markdown(
+                            "**Figure 3:** *Multi-metric polar evaluation profile of the generated response.* "
+                            "Assesses Retrieval Confidence, Answer Groundedness, Semantic Alignment, System Speed Efficiency, "
+                            "and Recommendation Alignment against the 40% Web Fallback Decision Threshold."
+                        )
+                        f3_files = st.session_state.figure_files.get("performance_radar", {}) if st.session_state.figure_files else {}
+                        d3_col1, d3_col2 = st.columns(2)
+                        with d3_col1:
+                            if "png" in f3_files and os.path.exists(f3_files["png"]):
+                                with open(f3_files["png"], "rb") as f:
+                                    st.download_button(
+                                        "⬇ Download Fig 3 (300 DPI PNG)",
+                                        data=f.read(),
+                                        file_name=os.path.basename(f3_files["png"]),
+                                        mime="image/png",
+                                        key="dl_fig3_png",
+                                        use_container_width=True
+                                    )
+                        with d3_col2:
+                            if "pdf" in f3_files and os.path.exists(f3_files["pdf"]):
+                                with open(f3_files["pdf"], "rb") as f:
+                                    st.download_button(
+                                        "⬇ Download Fig 3 (Vector PDF - LaTeX)",
+                                        data=f.read(),
+                                        file_name=os.path.basename(f3_files["pdf"]),
+                                        mime="application/pdf",
+                                        key="dl_fig3_pdf",
+                                        use_container_width=True
+                                    )
+                        with st.expander("📋 LaTeX Snippet for Figure 3"):
+                            pdf_name = os.path.basename(f3_files.get("pdf", "fig3_rag_verification_profile.pdf"))
+                            st.code(
+                                "\\begin{figure}[htbp]\n"
+                                "  \\centering\n"
+                                f"  \\includegraphics[width=0.85\\linewidth]{{{pdf_name}}}\n"
+                                "  \\caption{Polar radar profile of RAG verification metrics against the 40\\% fallback threshold.}\n"
+                                "  \\label{fig:performance_radar}\n"
+                                "\\end{figure}",
+                                language="latex"
+                            )
+
+                # --- Tab 4: Pipeline Latency Breakdown ---
+                with tab4:
+                    if "latency_breakdown" in st.session_state.figures and st.session_state.figures["latency_breakdown"]:
+                        st.pyplot(st.session_state.figures["latency_breakdown"], use_container_width=True)
+                        st.markdown(
+                            "**Figure 4:** *Horizontal latency composition of the end-to-end RAG pipeline.* "
+                            "Breaks down dense retrieval, hybrid fusion, and AGMR reranking versus LLM generation time."
+                        )
+                        f4_files = st.session_state.figure_files.get("latency_breakdown", {}) if st.session_state.figure_files else {}
+                        d4_col1, d4_col2 = st.columns(2)
+                        with d4_col1:
+                            if "png" in f4_files and os.path.exists(f4_files["png"]):
+                                with open(f4_files["png"], "rb") as f:
+                                    st.download_button(
+                                        "⬇ Download Fig 4 (300 DPI PNG)",
+                                        data=f.read(),
+                                        file_name=os.path.basename(f4_files["png"]),
+                                        mime="image/png",
+                                        key="dl_fig4_png",
+                                        use_container_width=True
+                                    )
+                        with d4_col2:
+                            if "pdf" in f4_files and os.path.exists(f4_files["pdf"]):
+                                with open(f4_files["pdf"], "rb") as f:
+                                    st.download_button(
+                                        "⬇ Download Fig 4 (Vector PDF - LaTeX)",
+                                        data=f.read(),
+                                        file_name=os.path.basename(f4_files["pdf"]),
+                                        mime="application/pdf",
+                                        key="dl_fig4_pdf",
+                                        use_container_width=True
+                                    )
+                        with st.expander("📋 LaTeX Snippet for Figure 4"):
+                            pdf_name = os.path.basename(f4_files.get("pdf", "fig4_pipeline_latency.pdf"))
+                            st.code(
+                                "\\begin{figure}[htbp]\n"
+                                "  \\centering\n"
+                                f"  \\includegraphics[width=0.9\\linewidth]{{{pdf_name}}}\n"
+                                "  \\caption{End-to-end RAG latency breakdown comparing retrieval \\& AGMR reranking with LLM generation.}\n"
+                                "  \\label{fig:latency_breakdown}\n"
+                                "\\end{figure}",
+                                language="latex"
+                            )
+
+                st.info(
+                    "📁 **All figures are automatically exported to `results/figures/`** "
+                    "in both publication-grade 300 DPI PNG and vector PDF format for direct inclusion in LaTeX or Word documents."
                 )
 
 

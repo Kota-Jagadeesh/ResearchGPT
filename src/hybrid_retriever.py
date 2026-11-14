@@ -1,6 +1,6 @@
 import numpy as np
 
-from dense_retriever import retrieve
+from dense_retriever import retrieve, encode_query
 from bm25_retriever import bm25_search
 
 # ==========================================================
@@ -46,60 +46,22 @@ def hybrid_search(
     # --------------------------------------------------------
     # Metadata Filtering (Scoped Retrieval)
     # --------------------------------------------------------
-    # paper_filter: optional list of paper filenames to restrict
-    # results to (e.g. ["RAG.pdf", "FiD.pdf"]). Since dense/sparse
-    # retrieval return a fixed top_k BEFORE filtering, most of
-    # that top_k may belong to papers outside the filter — so
-    # when a filter is active, we retrieve a larger candidate
-    # pool first, then filter, so the effective top_k after
-    # filtering still has enough real candidates left.
+    # paper_filter is passed directly to dense and sparse search
+    # so that top candidates from the targeted paper(s) are
+    # guaranteed to be retrieved, preventing post-hoc truncation.
     # --------------------------------------------------------
 
-    effective_dense_top_k = dense_top_k
-
-    effective_sparse_top_k = sparse_top_k
-
-    if paper_filter:
-
-        effective_dense_top_k = min(dense_top_k * 3, 500)
-
-        effective_sparse_top_k = min(sparse_top_k * 3, 500)
-
     dense_results = retrieve(
-
         question,
-
-        top_k=effective_dense_top_k
-
+        top_k=dense_top_k,
+        paper_filter=paper_filter
     )
 
     sparse_results = bm25_search(
-
         question,
-
-        top_k=effective_sparse_top_k
-
+        top_k=sparse_top_k,
+        paper_filter=paper_filter
     )
-
-    if paper_filter:
-
-        paper_filter_set = set(paper_filter)
-
-        dense_results = [
-
-            item for item in dense_results
-
-            if item["paper_name"] in paper_filter_set
-
-        ]
-
-        sparse_results = [
-
-            item for item in sparse_results
-
-            if item["paper_name"] in paper_filter_set
-
-        ]
 
     # ------------------------------------------------------
     # IMPORTANT: faiss_db.py builds an IndexFlatIP index on
@@ -183,22 +145,37 @@ def hybrid_search(
         )
 
     # ------------------------------------------------------
-    # Ensure every merged item carries a "distance" field.
-    # Items that came ONLY from sparse (BM25) results won't
-    # have one (BM25 has no notion of vector similarity), and
-    # downstream code (calculate_confidence, AGMR clustering)
-    # expects "distance" to exist on every chunk, consistently
-    # meaning higher-is-better similarity. hybrid_score is
-    # already on that same higher-is-better scale, so it's
-    # used directly as the proxy — NOT (1 - hybrid_score),
-    # which would flip the convention backwards.
+    # Ensure every merged item carries a real "distance" field
+    # (cosine similarity). Items that came ONLY from BM25
+    # have their embedding attached; we compute the exact
+    # cosine similarity with the query vector via dot product.
     # ------------------------------------------------------
+
+    q_vec = None
+    try:
+        q_vec = encode_query(question)
+    except Exception as e:
+        print(f"Warning: could not encode query for sparse distance: {e}")
 
     for key, item in merged.items():
 
         if "distance" not in item:
 
-            item["distance"] = item["hybrid_score"]
+            if q_vec is not None and "embedding" in item and item["embedding"] is not None:
+
+                emb = item["embedding"]
+
+                norm = np.linalg.norm(emb)
+
+                if norm > 0:
+
+                    emb = emb / norm
+
+                item["distance"] = float(np.dot(q_vec, emb))
+
+            else:
+
+                item["distance"] = float(item["hybrid_score"])
 
     results = list(
 

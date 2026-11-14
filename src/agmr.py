@@ -16,125 +16,69 @@ from confidence import calculate_confidence
 # passages of the same point.
 
 def _diversify_with_gmm(
-
     chunks,
-
     num_clusters,
-
     final_chunks
-
 ):
-
-    # NOTE: "distance" here is actually cosine similarity
-    # (higher = better match), inherited from dense_retriever.py
-    # (IndexFlatIP on normalized vectors) and hybrid_retriever.py.
-    # All sorting/tie-breaking below prefers HIGHER distance.
+    """
+    Diversifies top Cross-Encoder reranked candidates using GMM clustering.
+    Guarantees the #1 Cross-Encoder match is always selected, then incorporates
+    high-quality candidates from other semantic clusters to prevent redundancy,
+    while filling remaining slots with top reranked evidence.
+    """
+    if len(chunks) <= final_chunks:
+        return chunks
 
     embeddings = np.asarray(
         [chunk["embedding"] for chunk in chunks],
         dtype=np.float32
     )
 
-    num_clusters = min(
-        num_clusters,
-        len(embeddings)
-    )
+    num_clusters = min(num_clusters, len(embeddings))
 
     if num_clusters <= 0:
         return chunks[:final_chunks]
 
     try:
-
         gmm = GaussianMixture(
             n_components=num_clusters,
             covariance_type="full",
             random_state=42
         )
-
-        gmm.fit(embeddings)
-
+        labels = gmm.fit_predict(embeddings)
     except Exception as e:
-
-        print(e)
-
+        print(f"GMM clustering fallback: {e}")
         return chunks[:final_chunks]
 
-    labels = gmm.predict(embeddings)
+    # Assign cluster labels
+    for idx, c in enumerate(chunks):
+        c["_cluster"] = int(labels[idx])
 
-    probabilities = gmm.predict_proba(embeddings)
+    selected = [chunks[0]]
+    selected_keys = {(chunks[0]["paper_name"], chunks[0]["chunk_id"])}
+    seen_clusters = {chunks[0]["_cluster"]}
 
-    cluster_scores = []
-
-    for cluster in range(num_clusters):
-
-        ids = np.where(labels == cluster)[0]
-
-        if len(ids) == 0:
-            continue
-
-        confidence = float(
-            probabilities[ids, cluster].mean()
-        )
-
-        average_distance = float(
-            np.mean([chunks[idx]["distance"] for idx in ids])
-        )
-
-        cluster_scores.append(
-            {
-                "cluster": cluster,
-                "confidence": confidence,
-                "average_distance": average_distance,
-                "ids": ids
-            }
-        )
-
-    cluster_scores.sort(
-        key=lambda x: (-x["confidence"], -x["average_distance"])
-    )
-
-    print("\nCluster Confidence\n")
-
-    for cluster in cluster_scores:
-
-        print(
-            f"Cluster {cluster['cluster']} | "
-            f"Confidence = {cluster['confidence']:.4f} | "
-            f"Average Distance = {cluster['average_distance']:.4f} | "
-            f"Chunks = {len(cluster['ids'])}"
-        )
-
-    selected = []
-
-    used = set()
-
-    for cluster in cluster_scores:
-
-        cluster_items = sorted(
-            cluster["ids"],
-            key=lambda idx: chunks[idx]["distance"],
-            reverse=True
-        )
-
-        for idx in cluster_items:
-
-            key = (
-                chunks[idx]["paper_name"],
-                chunks[idx]["chunk_id"]
-            )
-
-            if key in used:
-                continue
-
-            used.add(key)
-
-            selected.append(chunks[idx])
-
-            if len(selected) >= final_chunks:
-                break
-
+    # Try to pick the best chunk from distinct clusters if relevance is good
+    for c in chunks[1:]:
         if len(selected) >= final_chunks:
             break
+        key = (c["paper_name"], c["chunk_id"])
+        if key in selected_keys:
+            continue
+        # Only take diverse clusters if the candidate is not deeply negative
+        if c["_cluster"] not in seen_clusters and c.get("cross_score", 0.0) > -2.0:
+            seen_clusters.add(c["_cluster"])
+            selected.append(c)
+            selected_keys.add(key)
+
+    # Fill remaining slots with the highest-ranked Cross-Encoder candidates
+    for c in chunks[1:]:
+        if len(selected) >= final_chunks:
+            break
+        key = (c["paper_name"], c["chunk_id"])
+        if key not in selected_keys:
+            selected.append(c)
+            selected_keys.add(key)
 
     return selected
 
@@ -172,12 +116,30 @@ def agmr_rerank(
 
     if len(candidates) == 0:
 
-        print("No chunks retrieved.")
+        if paper_filter:
+            try:
+                from dense_retriever import _metadata, _embeddings, _load_resources
+                _load_resources()
+                filter_set = set(paper_filter)
+                for idx, m in enumerate(_metadata):
+                    if m.get("paper_name") in filter_set:
+                        item = m.copy()
+                        item["distance"] = 0.40
+                        if _embeddings is not None and idx < len(_embeddings):
+                            item["embedding"] = _embeddings[idx]
+                        candidates.append(item)
+                if candidates:
+                    print(f"Safety fallback recovered {len(candidates)} candidates from metadata for {paper_filter}")
+            except Exception as e:
+                print(f"Metadata fallback notice: {e}")
 
-        return [], {
-            "confidence": 0,
-            "label": "No Confidence"
-        }
+        if len(candidates) == 0:
+            print("No chunks retrieved.")
+
+            return [], {
+                "confidence": 0,
+                "label": "No Confidence"
+            }
 
     print(f"Hybrid Candidates : {len(candidates)}")
 
@@ -219,8 +181,10 @@ def agmr_rerank(
         selected = reranked[:final_chunks]
 
     confidence_result = calculate_confidence(
-        selected
+        selected,
+        question=question
     )
+    confidence_result["candidates_pool"] = candidates
 
     print("\n")
     print("=" * 70)
