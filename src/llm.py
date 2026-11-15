@@ -71,9 +71,15 @@ def call_groq(
 ):
 
     models_to_try = [
-        MODEL_NAME,
-        FALLBACK_MODEL
+        MODEL_NAME,            # "openai/gpt-oss-20b"
+        FALLBACK_MODEL,        # "openai/gpt-oss-120b"
+        "qwen/qwen3.8-27b"     # Fast, non-reasoning fallback
     ]
+
+    # Reasoning models (e.g. openai/gpt-oss-*) consume internal tokens for reasoning.
+    # We ensure at least 600 tokens are allocated so the model does not exhaust tokens
+    # before outputting content.
+    effective_max_tokens = max(max_tokens, 600)
 
     last_error = None
 
@@ -90,6 +96,10 @@ def call_groq(
                 print("Model :", model)
                 print("Attempt :", attempt + 1)
 
+                extra_args = {}
+                if "gpt-oss" in model:
+                    extra_args["include_reasoning"] = False
+
                 response = client.chat.completions.create(
 
                     model=model,
@@ -103,11 +113,9 @@ def call_groq(
 
                     temperature=temperature,
 
-                    max_tokens=max_tokens,
+                    max_tokens=effective_max_tokens,
 
-                    # GPT-OSS models can return reasoning separately.
-                    # We only need the final answer.
-                    include_reasoning=False
+                    **extra_args
 
                 )
 
@@ -119,7 +127,8 @@ def call_groq(
 
                     continue
 
-                content = response.choices[0].message.content
+                choice = response.choices[0]
+                content = choice.message.content
 
                 if content is None:
 
@@ -133,7 +142,10 @@ def call_groq(
 
                 if not content:
 
-                    print("Groq returned an empty answer.")
+                    if getattr(choice, "finish_reason", "") == "length":
+                        print("Reasoning model hit token limit before writing content.")
+                    else:
+                        print("Groq returned an empty answer.")
 
                     last_error = "Empty response returned by Groq."
 

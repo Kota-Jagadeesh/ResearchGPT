@@ -553,6 +553,14 @@ if ask:
                 target_papers=target_papers
             )
 
+            # Safety guard against error messages escaping as queries
+            if (
+                resolved_question.startswith("TEMPORARY ERROR:")
+                or resolved_question.startswith("TEMPORARY LIMIT:")
+                or "could not generate a response" in resolved_question
+            ):
+                resolved_question = question
+                was_rewritten = False
 
             if was_rewritten:
 

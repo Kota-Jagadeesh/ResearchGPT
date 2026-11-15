@@ -165,21 +165,27 @@ Return ONLY the rewritten search question. No explanation, no quotes, no prefix.
         rewritten = call_groq(
             prompt,
             temperature=0.1,
-            max_tokens=100
+            max_tokens=600
         ).strip().strip('"').strip("'")
     except Exception as e:
         rewritten = ""
 
-    # Sanitize and guard against truncated or empty LLM outputs
-    if (
+    # Sanitize and guard against API errors, truncated outputs, or empty responses
+    is_error_output = (
         not rewritten
-        or rewritten.endswith(",")
+        or rewritten.startswith("TEMPORARY ERROR:")
+        or rewritten.startswith("TEMPORARY LIMIT:")
+        or "could not generate a response" in rewritten
+        or "API quota has been reached" in rewritten
+        or rewritten.rstrip().endswith((",", " of", " the", " in", " for", " with"))
         or len(rewritten.split()) < 3
         or ("this paper" in rewritten.lower() and target_title)
-    ):
+    )
+
+    if is_error_output:
         if target_title:
             q_clean = question.lower()
-            if any(w in q_clean for w in ["model", "models", "architecture"]):
+            if any(w in q_clean for w in ["model", "models", "architecture", "algorithm"]):
                 return f"What AI models, neural network architectures, and algorithms are used in {target_title}?", True
             elif any(w in q_clean for w in ["author", "who wrote", "researcher"]):
                 return f"Who are the authors and researchers of {target_title}?", True
